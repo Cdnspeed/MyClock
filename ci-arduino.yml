@@ -1,0 +1,35 @@
+name: Arduino CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Arduino CLI
+        uses: arduino/setup-arduino-cli@v1
+
+      - name: Install ESP32 core
+        run: |
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32
+
+      - name: Verify build (if sketches exist)
+        run: |
+          shopt -s globstar nullglob
+          SKETCHES=(src/**/*.ino src/*.ino)
+          if [ ${#SKETCHES[@]} -eq 0 ]; then
+            echo "No Arduino sketches found yet. Skipping compile."
+            exit 0
+          fi
+          for sketch in "${SKETCHES[@]}"; do
+            echo "Compiling $sketch"
+            arduino-cli compile --fqbn esp32:esp32:esp32s3 "$sketch"
+          done
