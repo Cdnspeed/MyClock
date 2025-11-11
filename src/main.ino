@@ -1,184 +1,110 @@
-// MyClock – Stage 1 (Arduino): Panel + Touch baseline (Waveshare 1.75" AMOLED)
-// Uses your config.h (CO5300 QSPI + CST9217 I2C)
-
-// Core: esp32 by Espressif 3.1.x
-// Libs: "GFX Library for Arduino" (Arduino_GFX), optional "SensorLib" for CST9217
+// MyClock – Stage 1 (Arduino): Panel + Touch baseline
+// Layout: this sketch + gfx_driver.* + pmic_axp2101.* + touch_input.* + config.h
+//
+// What this does:
+//  - Powers up PMIC & panel (gfx_driver_init)
+//  - Inits LVGL and registers display (gfx_lvgl_register)
+//  - Inits touch (touch_input_init) [your module]
+//  - Shows a label and attaches a visible cursor to the touch indev
 
 #include <Arduino.h>
-#include <Wire.h>
-#include <Arduino_GFX_Library.h>
-#include "config.h"   // <- place your config.h next to this file (src/config.h)
 
-// ---- Resolve geometry from config.h ----
-#ifndef LCD_WIDTH
-  #define LCD_WIDTH  466
-#endif
-#ifndef LCD_HEIGHT
-  #define LCD_HEIGHT 466
-#endif
-#define LCD_W  LCD_WIDTH
-#define LCD_H  LCD_HEIGHT
+// Ensure LVGL can use a local lv_conf.h if you add one later
+#define LV_CONF_INCLUDE_SIMPLE
+#include <lvgl.h>
 
-// ---- Resolve QSPI pins from config.h ----
-#ifndef LCD_SDIO0
-  #error "LCD_SDIO0 not defined in config.h"
-#endif
-#ifndef LCD_SDIO1
-  #error "LCD_SDIO1 not defined in config.h"
-#endif
-#ifndef LCD_SDIO2
-  #error "LCD_SDIO2 not defined in config.h"
-#endif
-#ifndef LCD_SDIO3
-  #error "LCD_SDIO3 not defined in config.h"
-#endif
-#ifndef LCD_SCLK
-  #error "LCD_SCLK not defined in config.h"
-#endif
-#ifndef LCD_CS
-  #error "LCD_CS not defined in config.h"
-#endif
-#ifndef LCD_RESET
-  #define LCD_RESET -1
-#endif
-#ifndef LCD_QSPI_HZ
-  #define LCD_QSPI_HZ 80000000UL
-#endif
+#include "config.h"
+#include "gfx_driver.h"
+#include "pmic_axp2101.h"
+#include "touch_input.h"   // provides touch_input_init()
 
-// ---- Resolve I2C pins for touch from config.h ----
-#ifndef IIC_SDA
-  #define IIC_SDA 15
-#endif
-#ifndef IIC_SCL
-  #define IIC_SCL 14
-#endif
-#define TP_SDA  IIC_SDA
-#define TP_SCL  IIC_SCL
-#define TP_INT  -1
-#define TP_ADDR 0x15  // common for CST9217
+// ---------- UI ----------
+static lv_obj_t *label;
+static uint32_t frames = 0;
+static uint32_t last_ms = 0;
 
-// Optional tearing input (not wired on this board)
-#define LCD_TE  -1
-
-// -----------------------------------------------------------------------------
-// Arduino_GFX CO5300 / ICNA3311 setup
-Arduino_DataBus *bus = new Arduino_ESP32QSPI(
-    LCD_SDIO0 /* D0 */, LCD_SDIO1 /* D1 */, LCD_SDIO2 /* D2 */, LCD_SDIO3 /* D3 */,
-    LCD_SCLK /* SCLK */, LCD_CS /* CS */);
-
-// Prefer CO5300 class if present, otherwise ICNA3311 fallback.
-#if __has_include("Arduino_CO5300.h") || defined(ARDUINO_CO5300_CLASS)
-  Arduino_GFX *gfx = new Arduino_CO5300(bus, LCD_RESET /* RST */, 0 /* rot */, true /* IPS */, LCD_W, LCD_H);
-#else
-  Arduino_GFX *gfx = new Arduino_ICNA3311(bus, LCD_RESET /* RST */, 0 /* rot */, true /* IPS */, LCD_W, LCD_H);
-#endif
-
-// Optional touch via SensorLib (auto-disabled if not installed)
-#if __has_include(<SensorLib.h>)
-  #include <SensorLib.h>
-  using namespace SensorLib;
-  CST9217 touch;
-  bool touch_ok = false;
-#else
-  bool touch_ok = false;
-#endif
-
-// -----------------------------------------------------------------------------
-// Simple visual/touch validation
-static uint32_t frame = 0, last_ms = 0;
-static float fps = 0.0f;
-
-static void draw_header() {
-  gfx->fillRect(0, 0, LCD_W, 24, RGB565_BLACK);
-  gfx->setCursor(8, 18);
-  gfx->setTextColor(RGB565_WHITE);
-  gfx->setTextSize(1);
-  gfx->printf("MyClock Stage 1 | %ux%u | %.1f FPS", (unsigned)LCD_W, (unsigned)LCD_H, fps);
-}
-
-static void draw_background() {
-  // radial rings to check scanout/center
-  const int cx = LCD_W / 2;
-  const int cy = LCD_H / 2;
-  for (int r = 8; r < min(LCD_W, LCD_H) / 2; r += 10) {
-    uint16_t c = (r / 10) % 2 ? RGB565_DARKGREEN : RGB565_DARKBLUE;
-    gfx->drawCircle(cx, cy, r, c);
+// Try to find a POINTER input device and attach a visible cursor.
+// Returns true once attached.
+static bool attach_pointer_cursor_try() {
+  // Find the first pointer-type input device registered with LVGL
+  lv_indev_t *indev = nullptr;
+  for (lv_indev_t *i = nullptr; (i = lv_indev_get_next(i)); ) {
+    if (lv_indev_get_type(i) == LV_INDEV_TYPE_POINTER) { indev = i; break; }
   }
+  if (!indev) return false;
+
+  // Cursor object: black circle with white border (visible on white backgrounds)
+  lv_obj_t *cursor = lv_obj_create(lv_screen_active());
+  lv_obj_set_size(cursor, 16, 16);
+  lv_obj_set_style_radius(cursor, 8, 0);
+  lv_obj_set_style_bg_color(cursor, lv_color_black(), 0);
+  lv_obj_set_style_border_width(cursor, 2, 0);
+  lv_obj_set_style_border_color(cursor, lv_color_white(), 0);
+  lv_obj_add_flag(cursor, LV_OBJ_FLAG_IGNORE_LAYOUT);
+
+  lv_indev_set_cursor(indev, cursor);
+  return true;
 }
 
-static void draw_touch_point(int x, int y) {
-  const int rad = 8;
-  gfx->fillCircle(x, y, rad, RGB565_YELLOW);
-  gfx->drawCircle(x, y, rad + 3, RGB565_RED);
-  gfx->drawFastHLine(max(0, x - 20), y, 40, RGB565_RED);
-  gfx->drawFastVLine(x, max(0, y - 20), 40, RGB565_RED);
+static void ui_init() {
+  lv_obj_t *scr = lv_screen_active();
+
+  // Optional: comment this out if you prefer LVGL's default bg
+  // lv_obj_set_style_bg_color(scr, lv_color_white(), 0);
+
+  label = lv_label_create(scr);
+  lv_label_set_text(label, "MyClock Stage 1\nPanel + Touch");
+  lv_obj_center(label);
 }
 
-static void i2c_scan_once() {
-  Serial.println(F("[I2C] scanning..."));
-  uint8_t found = 0;
-  for (uint8_t addr = 8; addr < 120; addr++) {
-    Wire.beginTransmission(addr);
-    if (Wire.endTransmission() == 0) {
-      Serial.printf("[I2C] device @ 0x%02X\n", addr);
-      found++;
-    }
-  }
-  if (!found) Serial.println(F("[I2C] no devices"));
-}
-
-// -----------------------------------------------------------------------------
-// Arduino entry points
+// ---------- Arduino entry points ----------
 void setup() {
   Serial.begin(115200);
   delay(200);
 
-  // Display init
-  if (!gfx->begin(LCD_QSPI_HZ)) {
-    Serial.println(F("[LCD] gfx->begin() failed"));
-    while (true) delay(1000);
-  }
-  if (LCD_TE >= 0) pinMode(LCD_TE, INPUT);
+  // 1) Power rails + panel (your driver handles AXP2101 + QSPI CO5300 bring-up)
+  gfx_driver_init();
 
-  gfx->fillScreen(RGB565_BLACK);
-  gfx->setTextWrap(false);
-  draw_background();
-  draw_header();
+  // 2) LVGL core + display registration (your driver provides flush)
+  lv_init();
+  gfx_lvgl_register();
 
-  // I2C / touch init
-  Wire.begin(TP_SDA, TP_SCL, 400000);
-  delay(50);
-  i2c_scan_once();
+  // 3) Touch init (your module registers the touch controller with its driver)
+  touch_input_init();
 
-#if __has_include(<SensorLib.h>)
-  if (touch.begin(Wire, TP_ADDR)) {
-    touch_ok = true;
-    Serial.println(F("[TP] CST9217 init OK"));
-  } else {
-    Serial.println(F("[TP] CST9217 init FAILED (check pins/address)"));
-  }
-#endif
+  // 4) Minimal UI
+  ui_init();
 
   last_ms = millis();
 }
 
 void loop() {
-  frame++;
+  // Run LVGL
+  lv_timer_handler();
+
+  // Provide LVGL ticks (1 ms)
+  static uint32_t last_tick = 0;
   uint32_t now = millis();
-  if (now - last_ms >= 500) {
-    fps = (frame * 1000.0f) / (now - last_ms);
-    frame = 0;
-    last_ms = now;
-    draw_header();
+  lv_tick_inc(now - last_tick);
+  last_tick = now;
+
+  // Attach a visible cursor once the touch indev appears
+  static bool cursor_attached = false;
+  if (!cursor_attached) {
+    cursor_attached = attach_pointer_cursor_try();
   }
 
-#if __has_include(<SensorLib.h>)
-  if (touch_ok) {
-    uint16_t x = 0, y = 0;
-    bool pressed = false;
-    if (touch.getPoint(&x, &y, &pressed)) {
-      if (pressed) draw_touch_point(x, y);
-    }
+  // Simple FPS readout on the label
+  frames++;
+  if (now - last_ms >= 500) {
+    float fps = (frames * 1000.0f) / (now - last_ms);
+    frames = 0;
+    last_ms = now;
+
+    char buf[64];
+    snprintf(buf, sizeof(buf), "MyClock Stage 1\n%.1f FPS", fps);
+    lv_label_set_text(label, buf);
   }
-#endif
+
+  delay(5);
 }
