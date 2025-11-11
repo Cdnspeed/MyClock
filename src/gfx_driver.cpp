@@ -53,34 +53,7 @@ Arduino_GFX     *gfx = nullptr;
 // ---------------- LVGL display objects ----------------
 
 static lv_display_t *s_disp = nullptr;
-
-// Use two small line-buffers in PSRAM for partial rendering
-#ifndef LVGL_STRIP_LINES
-#define LVGL_STRIP_LINES  64   // tune: 40..120
-#endif
-
-static lv_color_t *s_buf1 = nullptr;  // lives in PSRAM
-static lv_color_t *s_buf2 = nullptr;  // lives in PSRAM
-static size_t      s_buf_bytes = 0;
-
-// ---------- NEW: rounder callback to align flush regions ----------
-static void my_rounder_cb(lv_display_t * /*d*/, lv_area_t *a)
-{
-    // Align X to even pixels (RGB565 pairs) to avoid odd-width DMA windows
-    a->x1 = (a->x1) & ~1;
-    a->x2 = ((a->x2 + 1) + 1 - 1) & ~1; // align up, then -1
-
-    // Expand Y to full strip chunks that match our buffer height
-    int32_t y1 = a->y1 - (a->y1 % LVGL_STRIP_LINES);
-    int32_t y2 = ((a->y2 + 1 + LVGL_STRIP_LINES - 1) / LVGL_STRIP_LINES) * LVGL_STRIP_LINES - 1;
-
-    // Clamp to screen bounds
-    if (y1 < 0) y1 = 0;
-    if (y2 >= LCD_HEIGHT) y2 = LCD_HEIGHT - 1;
-
-    a->y1 = y1;
-    a->y2 = y2;
-}
+static lv_color_t   *s_draw_buf = nullptr;  // lives in PSRAM
 
 // Flush callback: push LVGL's RGB565 buffer region to the CO5300 panel
 static void my_flush_cb(lv_display_t *d, const lv_area_t *area, uint8_t *px_map)
@@ -94,9 +67,7 @@ static void my_flush_cb(lv_display_t *d, const lv_area_t *area, uint8_t *px_map)
     uint32_t w = static_cast<uint32_t>(area->x2 - area->x1 + 1);
     uint32_t h = static_cast<uint32_t>(area->y2 - area->y1 + 1);
 
-    // IMPORTANT: push only the invalidated rectangle (partial update)
     gfx->draw16bitRGBBitmap(area->x1, area->y1, src, w, h);
-
     lv_display_flush_ready(d);
 }
 
@@ -138,16 +109,13 @@ void gfx_driver_init()
         bus->endWrite();
     }
 
-    // Allocate two PSRAM line-buffers for LVGL partial rendering
-    const size_t strip_pixels = static_cast<size_t>(LCD_WIDTH) * static_cast<size_t>(LVGL_STRIP_LINES);
-    s_buf_bytes = strip_pixels * sizeof(lv_color_t);
-
-    s_buf1 = static_cast<lv_color_t*>(
-        heap_caps_malloc(s_buf_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    s_buf2 = static_cast<lv_color_t*>(
-        heap_caps_malloc(s_buf_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-
-    if (!s_buf1 || !s_buf2) {
+    // Allocate full-screen LVGL buffer in PSRAM
+    size_t buf_pixels = static_cast<size_t>(LCD_WIDTH) * static_cast<size_t>(LCD_HEIGHT);
+    s_draw_buf = static_cast<lv_color_t *>(
+        heap_caps_malloc(buf_pixels * sizeof(lv_color_t),
+                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!s_draw_buf) {
+        // Fallback: don't crash, but you'll get no drawing.
         while (1) {
             Serial.println("LVGL buffer PSRAM alloc failed");
             delay(1000);
@@ -160,24 +128,20 @@ void gfx_driver_init()
 
 void gfx_lvgl_register()
 {
-    if (s_disp) return;     // already registered
-    if (!s_buf1) return;    // init failed
+    if (s_disp) return;  // already registered
+    if (!s_draw_buf) return;  // init failed
 
     s_disp = lv_display_create(LCD_WIDTH, LCD_HEIGHT);
 
-    // NOTE: Your LVGL build doesn’t provide lv_display_set_rounder_cb().
-    // We’ll run without a rounder; partial mode + 64-line strips minimizes artifacts.
-
+    // Full-screen buffer, rendered + flushed in place.
     lv_display_set_flush_cb(s_disp, my_flush_cb);
     lv_display_set_buffers(
         s_disp,
-        s_buf1,
-        s_buf2,
-        s_buf_bytes,
-        LV_DISPLAY_RENDER_MODE_PARTIAL);
+        s_draw_buf,
+        nullptr,
+        LCD_WIDTH * LCD_HEIGHT * sizeof(lv_color_t),
+        LV_DISPLAY_RENDER_MODE_FULL);
 }
-
-
 
 void gfx_set_backlight(float level)
 {
