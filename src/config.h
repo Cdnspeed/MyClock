@@ -1,6 +1,6 @@
 #pragma once
 // MyClock – Stage 1 (Arduino) configuration
-// Hardware: Waveshare 1.75" ESP32-S3 round AMOLED (CO5300) + CST9217 touch
+// Board: Waveshare 1.75" ESP32-S3 round AMOLED (CO5300) + CST9217 touch
 
 // ---------------------------
 // Panel geometry
@@ -11,31 +11,34 @@
 // ---------------------------
 // QSPI display (CO5300) pins
 // ---------------------------
-// Data lines
 #define LCD_SDIO0   4
 #define LCD_SDIO1   5
 #define LCD_SDIO2   6
 #define LCD_SDIO3   7
-// Clock & chip-select
 #define LCD_SCLK    38
 #define LCD_CS      12
-// Reset (set to -1 if not wired)
-#define LCD_RESET   9
-// Optional tearing input (not used in Stage 1); keep -1 if not wired
-// #define LCD_TE   -1
+#define LCD_RESET   9   // set to -1 if not wired
 
-// QSPI clock (Hz). Many boards run 80 MHz reliably.
+// QSPI clock (Hz)
 #define LCD_QSPI_HZ 80000000UL
 
 // ---------------------------
-// I2C touch (CST9217) pins
+// I2C / Touch (CST92xx)
 // ---------------------------
 #define IIC_SDA     15
 #define IIC_SCL     14
 
-// (Touch INT pin not required; driver polls over I2C)
-// #define TP_INT   -1
+// Panel touch interrupt/reset pins
+#define TP_INT      11
+#define TP_RESET    40
+
+// Touch driver overrides (as used by touch_input.*)
+#define TOUCH_I2C_ADDR 0x5A         // change to 0x15 if your scanner reports that address
+#define TOUCH_INT_PIN  TP_INT
+#define TOUCH_RST_PIN  TP_RESET     // use -1 if no reset wire
 
 // ---------------------------
-// End of config
+// Back-compat aliases (safe no-ops if unused elsewhere)
 // ---------------------------
+#define LCD_W  LCD_WIDTH
+#define LCD_H  LCD_HEIGHT
